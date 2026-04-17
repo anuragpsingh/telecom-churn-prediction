@@ -28,7 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import ChurnConfig, cfg
-from data_generator import TelecomDataGenerator
+from data_generator import MobileDataGenerator as TelecomDataGenerator
 from trainer import ChurnTrainer
 
 logging.basicConfig(
@@ -76,9 +76,9 @@ def run_pipeline(
         logger.info("Loading data from %s", data_path)
         df = TelecomDataGenerator.load(data_path)
     else:
-        logger.info("Generating synthetic telecom data …")
+        logger.info("Generating synthetic mobile subscriber data …")
         df = gen.generate()
-        gen.save(df, "data/telecom_churn.csv")
+        gen.save(df, "data/mobile_churn.csv")
 
     train_df, val_df, test_df = gen.split(df)
 

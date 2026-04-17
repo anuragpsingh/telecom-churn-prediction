@@ -1,17 +1,17 @@
 """
-inference.py — Production-grade inference engine for the churn framework.
+inference.py — Production inference engine for mobile churn prediction.
 
 Supports:
-  - Single customer prediction
-  - Batch prediction (pandas DataFrame or numpy array)
+  - Single subscriber prediction (real-time, ~1 ms)
+  - Batch prediction from DataFrame or CSV
   - Ensemble scoring (XGBoost + TabTransformer)
-  - Confidence labels ("high_risk" / "medium_risk" / "low_risk")
-  - Lazy model loading (models initialised once on first call)
+  - Risk segments: high_risk / medium_risk / low_risk
+  - Lazy model loading (once on first call)
 
-Usage example:
+Usage:
     predictor = ChurnPredictor.from_checkpoints()
-    result = predictor.predict_single(customer_dict)
-    batch_df = predictor.predict_batch(df)
+    result    = predictor.predict_single(subscriber_dict)
+    batch_df  = predictor.predict_batch(df)
 """
 
 from __future__ import annotations
@@ -38,17 +38,17 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ChurnPrediction:
-    customer_id:       Optional[str]
+    subscriber_id:     Optional[str]
     churn_probability: float
-    churn_label:       int               # 0 or 1
-    risk_segment:      str               # "high_risk" | "medium_risk" | "low_risk"
+    churn_label:       int           # 0 = retained, 1 = churn
+    risk_segment:      str           # high_risk | medium_risk | low_risk
     xgb_score:         float
     transformer_score: float
     latency_ms:        float
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "customer_id":       self.customer_id,
+            "subscriber_id":     self.subscriber_id,
             "churn_probability": round(self.churn_probability, 4),
             "churn_label":       self.churn_label,
             "risk_segment":      self.risk_segment,
@@ -71,10 +71,10 @@ def _risk_segment(prob: float) -> str:
 # ---------------------------------------------------------------------------
 
 class ChurnPredictor:
-    """Lazy-loaded inference engine that wraps preprocessor + ensemble."""
+    """Lazy-loaded inference engine wrapping preprocessor + ensemble."""
 
     def __init__(self, config: ChurnConfig = cfg):
-        self.cfg           = config
+        self.cfg     = config
         self._prep:  Optional[ChurnPreprocessor]       = None
         self._xgb:   Optional[XGBoostChurnModel]       = None
         self._trn:   Optional[TabTransformerChurnModel] = None
@@ -87,57 +87,41 @@ class ChurnPredictor:
     @classmethod
     def from_checkpoints(
         cls,
-        config:           ChurnConfig = cfg,
-        preprocessor_path: str        = "checkpoints/preprocessor.pkl",
-        xgb_path:          str        = "checkpoints/xgboost_churn.json",
-        transformer_path:  str        = "checkpoints/transformer_churn_best.pt",
+        config:            ChurnConfig = cfg,
+        preprocessor_path: str = "checkpoints/preprocessor.pkl",
+        xgb_path:          str = "checkpoints/xgboost_mobile_churn.json",
+        transformer_path:  str = "checkpoints/transformer_mobile_churn_best.pt",
     ) -> "ChurnPredictor":
         predictor = cls(config)
         predictor._load_models(preprocessor_path, xgb_path, transformer_path)
         return predictor
 
-    def _load_models(
-        self,
-        preprocessor_path: str,
-        xgb_path: str,
-        transformer_path: str,
-    ) -> None:
+    def _load_models(self, prep_path, xgb_path, trn_path) -> None:
         if self._loaded:
             return
-        logger.info("Loading churn models …")
-
-        # Preprocessor
-        self._prep = ChurnPreprocessor.load(preprocessor_path)
-
-        # XGBoost
-        self._xgb = XGBoostChurnModel(self.cfg)
+        logger.info("Loading mobile churn models …")
+        self._prep = ChurnPreprocessor.load(prep_path)
+        self._xgb  = XGBoostChurnModel(self.cfg)
         self._xgb.load(xgb_path)
-
-        # Transformer — build net first so we can set indices
-        self._trn = TabTransformerChurnModel(self.cfg)
+        self._trn  = TabTransformerChurnModel(self.cfg)
         self._trn.num_idx_ = self._prep.get_numerical_indices()
         self._trn.cat_idx_ = self._prep.get_categorical_indices()
-        self._trn.load(transformer_path)
-
+        self._trn.load(trn_path)
         self._loaded = True
-        logger.info("All models loaded and ready.")
+        logger.info("Models loaded.")
 
     # ------------------------------------------------------------------
-    # Inference helpers
+    # Internal scoring
     # ------------------------------------------------------------------
 
-    def _score(self, X: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return (xgb_scores, transformer_scores) for a preprocessed array."""
-        xgb_s = self._xgb.predict_proba(X)
-        trn_s = self._trn.predict_proba(X)
-        return xgb_s, trn_s
+    def _score(self, X: np.ndarray):
+        return self._xgb.predict_proba(X), self._trn.predict_proba(X)
 
-    def _ensemble_score(
-        self, xgb_s: np.ndarray, trn_s: np.ndarray
-    ) -> np.ndarray:
-        ec  = self.cfg.ensemble
-        wt  = ec.xgb_weight + ec.transformer_weight
-        return (ec.xgb_weight * xgb_s + ec.transformer_weight * trn_s) / wt
+    def _ensemble(self, xgb_s, trn_s) -> np.ndarray:
+        ec = self.cfg.ensemble
+        return (ec.xgb_weight * xgb_s + ec.transformer_weight * trn_s) / (
+            ec.xgb_weight + ec.transformer_weight
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -145,42 +129,23 @@ class ChurnPredictor:
 
     def predict_single(
         self,
-        customer: Dict[str, Any],
-        customer_id: Optional[str] = None,
+        subscriber: Dict[str, Any],
+        subscriber_id: Optional[str] = None,
         threshold: float = 0.5,
     ) -> ChurnPrediction:
-        """
-        Predict churn for a single customer dictionary.
-
-        Parameters
-        ----------
-        customer    : dict with all feature columns (may include extra keys)
-        customer_id : optional identifier for tracking
-        threshold   : decision boundary (default 0.5)
-
-        Returns
-        -------
-        ChurnPrediction dataclass
-        """
-        t0 = time.perf_counter()
-
-        df  = pd.DataFrame([customer])
-        X   = self._prep.transform(df)
-
-        xgb_s, trn_s = self._score(X)
-        ens_s  = self._ensemble_score(xgb_s, trn_s)
-
-        prob   = float(ens_s[0])
-        latency= (time.perf_counter() - t0) * 1000
-
+        t0  = time.perf_counter()
+        X   = self._prep.transform(pd.DataFrame([subscriber]))
+        xs, ts = self._score(X)
+        prob = float(self._ensemble(xs, ts)[0])
+        ms   = (time.perf_counter() - t0) * 1000
         return ChurnPrediction(
-            customer_id       = customer_id,
+            subscriber_id     = subscriber_id,
             churn_probability = prob,
             churn_label       = int(prob >= threshold),
             risk_segment      = _risk_segment(prob),
-            xgb_score         = float(xgb_s[0]),
-            transformer_score = float(trn_s[0]),
-            latency_ms        = latency,
+            xgb_score         = float(xs[0]),
+            transformer_score = float(ts[0]),
+            latency_ms        = ms,
         )
 
     def predict_batch(
@@ -189,110 +154,151 @@ class ChurnPredictor:
         id_column: Optional[str] = None,
         threshold: float = 0.5,
     ) -> pd.DataFrame:
-        """
-        Predict churn for a DataFrame of customers.
-
-        Returns a DataFrame with prediction columns appended.
-        """
         t0 = time.perf_counter()
+        X  = self._prep.transform(df)
+        xs, ts = self._score(X)
+        ens = self._ensemble(xs, ts)
 
-        X = self._prep.transform(df)
-        xgb_s, trn_s = self._score(X)
-        ens_s = self._ensemble_score(xgb_s, trn_s)
-
-        results = df.copy()
+        out = pd.DataFrame(index=df.index)
         if id_column and id_column in df.columns:
-            results = results[[id_column]]
-        else:
-            results = pd.DataFrame(index=df.index)
+            out[id_column] = df[id_column]
+        out["churn_probability"]  = ens.round(4)
+        out["churn_label"]        = (ens >= threshold).astype(int)
+        out["risk_segment"]       = [_risk_segment(p) for p in ens]
+        out["xgb_score"]          = xs.round(4)
+        out["transformer_score"]  = ts.round(4)
 
-        results["churn_probability"]  = ens_s.round(4)
-        results["churn_label"]        = (ens_s >= threshold).astype(int)
-        results["risk_segment"]       = [_risk_segment(p) for p in ens_s]
-        results["xgb_score"]          = xgb_s.round(4)
-        results["transformer_score"]  = trn_s.round(4)
-
-        elapsed = (time.perf_counter() - t0) * 1000
-        logger.info(
-            "Batch inference: %d records | %.1f ms total | %.3f ms/record",
-            len(df), elapsed, elapsed / max(len(df), 1),
-        )
-        return results
+        ms = (time.perf_counter() - t0) * 1000
+        logger.info("Batch: %d records | %.1f ms | %.3f ms/record",
+                    len(df), ms, ms / max(len(df), 1))
+        return out
 
     def predict_batch_from_file(
-        self,
-        path: str,
-        output_path: Optional[str] = None,
+        self, path: str, output_path: Optional[str] = None,
         id_column: Optional[str] = None,
     ) -> pd.DataFrame:
-        """Load a CSV, run batch inference, optionally save results."""
         df  = pd.read_csv(path)
         out = self.predict_batch(df, id_column=id_column)
         if output_path:
             out.to_csv(output_path, index=False)
-            logger.info("Results saved → %s", output_path)
+            logger.info("Results → %s", output_path)
         return out
 
-    # ------------------------------------------------------------------
-    # Warm-up (pre-compile MPS/CUDA kernels)
-    # ------------------------------------------------------------------
-
     def warmup(self, n: int = 4) -> None:
-        """Run a dummy batch to trigger GPU kernel compilation."""
         logger.info("Warming up inference engine (n=%d) …", n)
-        dummy = {f: 0 for f in self.cfg.numerical_features}
-        dummy.update({f: "No" for f in self.cfg.categorical_features})
+        dummy = _sample_high_risk_subscriber()
         for _ in range(n):
             self.predict_single(dummy)
         logger.info("Warmup complete.")
 
 
 # ---------------------------------------------------------------------------
-# CLI quick-test
+# Sample subscriber helpers
 # ---------------------------------------------------------------------------
 
+def _sample_high_risk_subscriber() -> Dict[str, Any]:
+    """
+    A prepaid subscriber with poor network quality, low top-ups,
+    multiple complaints, and high call drop rate — classic high-risk profile.
+    """
+    return {
+        # Demographics
+        "age": 24,
+        # Account
+        "tenure_months": 3.0,
+        "monthly_plan_cost_eur": 8.5,
+        "total_spend_6mo_eur": 22.0,
+        # Network quality KPIs
+        "avg_sinr_db": -2.5,            # poor SINR
+        "avg_rsrp_dbm": -107.0,         # weak signal
+        "call_success_rate_pct": 93.5,  # below threshold
+        "bearer_establishment_rate_pct": 94.1,
+        "avg_call_drop_rate_pct": 5.2,  # high drop rate
+        "avg_data_speed_mbps": 2.1,
+        # Usage
+        "avg_monthly_data_gb": 1.2,
+        "avg_daily_data_usage_mb": 41.0,
+        "avg_daily_call_minutes": 18.0,
+        "avg_monthly_sms": 45,
+        "roaming_sessions_6mo": 0,
+        "intl_call_minutes_monthly": 0.0,
+        # Billing
+        "num_topups_6mo": 1,            # barely topped up → high lapse risk
+        "avg_topup_amount_eur": 7.0,
+        "num_late_payments_6mo": 0,
+        "data_overage_charges_eur": 0.0,
+        # Customer service
+        "num_complaints_6mo": 4,
+        "num_support_calls_6mo": 5,
+        "days_since_last_complaint": 8.0,
+        # Categorical
+        "plan_type": "prepaid",
+        "plan_tier": "basic",
+        "contract_duration": "prepaid",
+        "payment_method": "cash",
+        "network_generation": "4G",
+        "device_type": "smartphone",
+        "gender": "Male",
+        "is_roaming_enabled": "no",
+        "has_handset_subsidy": "no",
+    }
+
+
+def _sample_low_risk_subscriber() -> Dict[str, Any]:
+    """
+    A long-tenure postpaid subscriber on a 24-month contract with
+    good network quality and subsidised handset — classic low-risk profile.
+    """
+    return {
+        "age": 38,
+        "tenure_months": 54.0,
+        "monthly_plan_cost_eur": 17.5,
+        "total_spend_6mo_eur": 107.0,
+        "avg_sinr_db": 18.5,
+        "avg_rsrp_dbm": -78.0,
+        "call_success_rate_pct": 99.2,
+        "bearer_establishment_rate_pct": 99.5,
+        "avg_call_drop_rate_pct": 0.4,
+        "avg_data_speed_mbps": 95.0,
+        "avg_monthly_data_gb": 22.0,
+        "avg_daily_data_usage_mb": 760.0,
+        "avg_daily_call_minutes": 35.0,
+        "avg_monthly_sms": 20,
+        "roaming_sessions_6mo": 4,
+        "intl_call_minutes_monthly": 12.0,
+        "num_topups_6mo": 0,
+        "avg_topup_amount_eur": 0.0,
+        "num_late_payments_6mo": 0,
+        "data_overage_charges_eur": 0.0,
+        "num_complaints_6mo": 0,
+        "num_support_calls_6mo": 1,
+        "days_since_last_complaint": 180.0,
+        "plan_type": "postpaid",
+        "plan_tier": "unlimited",
+        "contract_duration": "24_month",
+        "payment_method": "direct_debit",
+        "network_generation": "5G",
+        "device_type": "smartphone",
+        "gender": "Female",
+        "is_roaming_enabled": "yes",
+        "has_handset_subsidy": "yes",
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI quick-test
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     predictor = ChurnPredictor.from_checkpoints()
     predictor.warmup()
 
-    # Test single prediction
-    sample_customer = {
-        "age": 35,
-        "tenure_months": 3,
-        "monthly_charges": 95.0,
-        "total_charges": 285.0,
-        "avg_monthly_charges": 95.0,
-        "avg_daily_call_minutes": 45.0,
-        "avg_monthly_data_gb": 20.0,
-        "avg_monthly_sms": 100,
-        "roaming_usage_min": 5.0,
-        "avg_call_drop_rate": 0.08,
-        "avg_data_speed_mbps": 200.0,
-        "network_outage_hours_6mo": 5.0,
-        "num_complaints_6mo": 3,
-        "num_support_calls_6mo": 4,
-        "days_since_last_complaint": 15.0,
-        "app_logins_monthly": 2,
-        "feature_adoption_score": 1.0,
-        "gender": "Male",
-        "senior_citizen": 0,
-        "has_partner": 0,
-        "has_dependents": 0,
-        "contract_type": "month-to-month",
-        "payment_method": "electronic_check",
-        "paperless_billing": 1,
-        "phone_service": 1,
-        "multiple_lines": "No",
-        "internet_service": "Fiber_optic",
-        "online_security": "No",
-        "online_backup": "No",
-        "device_protection": "No",
-        "tech_support": "No",
-        "streaming_tv": "No",
-        "streaming_movies": "No",
-    }
-
-    result = predictor.predict_single(sample_customer, customer_id="CUST-0001")
-    print("\nPrediction:", result.to_dict())
+    for label, sub in [
+        ("High-risk prepaid", _sample_high_risk_subscriber()),
+        ("Low-risk postpaid",  _sample_low_risk_subscriber()),
+    ]:
+        r = predictor.predict_single(sub, subscriber_id=label)
+        print(f"\n[{label}]")
+        for k, v in r.to_dict().items():
+            print(f"  {k:25s}: {v}")
