@@ -1,0 +1,31 @@
+# Telecom Churn Prediction Framework
+# Python 3.11+ recommended (tested on 3.13)
+#
+# INSTALL ORDER for Apple M5 Pro (MPS GPU):
+# ----------------------------------------
+# 1. pip install torch torchvision          # PyTorch with MPS support (no extra index needed on macOS)
+# 2. pip install -r requirements.txt
+#
+# PyTorch ships MPS support natively on macOS arm64 since 1.12.
+# Do NOT use the linux/CUDA wheel — the standard macOS wheel is correct.
+
+# Core ML
+xgboost>=2.0.3
+scikit-learn>=1.4.0
+
+# Deep learning — MPS backend included in the standard macOS wheel
+torch>=2.2.0
+torchvision>=0.17.0
+
+# Data
+numpy>=1.26.0
+pandas>=2.2.0
+
+# Visualisation
+matplotlib>=3.8.0
+
+# Optional: SHAP explainability (uncomment to enable)
+# shap>=0.45.0
+
+# Dev utilities
+tqdm>=4.66.0
