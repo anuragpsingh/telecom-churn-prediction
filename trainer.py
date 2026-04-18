@@ -23,6 +23,7 @@ from preprocessor import ChurnPreprocessor
 from models.xgboost_model import XGBoostChurnModel
 from models.transformer_model import TabTransformerChurnModel
 from evaluator import ChurnEvaluator
+from shap_explainer import ShapExplainer
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ class ChurnTrainer:
         self.xgb_model_ : Optional[XGBoostChurnModel]       = None
         self.trn_model_ : Optional[TabTransformerChurnModel] = None
         self.evaluator_ : ChurnEvaluator                    = ChurnEvaluator(config)
+        self.shap_      : ShapExplainer                     = ShapExplainer(config)
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -98,19 +100,22 @@ class ChurnTrainer:
             X_train, y_train, X_val, y_val, X_test, y_test, feature_names
         )
 
-        # 3. Train TabTransformer
+        # 3. SHAP explanation for XGBoost
+        self._run_shap(X_train, X_test, y_test, feature_names)
+
+        # 4. Train TabTransformer
         trn_metrics = self._train_transformer(
             X_train, y_train, X_val, y_val, X_test, y_test, num_idx, cat_idx
         )
 
-        # 4. Ensemble
+        # 5. Ensemble
         ens_metrics = self._evaluate_ensemble(X_test, y_test)
 
-        # 5. Save artefacts
+        # 6. Save artefacts
         self.prep_.save()
         self.xgb_model_.save()
 
-        # 6. Report
+        # 7. Report
         comparison = self.evaluator_.compare()
         logger.info("\n%s", comparison.to_string())
         self.evaluator_.save_report()
@@ -146,6 +151,45 @@ class ChurnTrainer:
             feature_importance=self.xgb_model_.feature_importance(),
         )
         return metrics
+
+    # ------------------------------------------------------------------
+    # SHAP explanation (XGBoost)
+    # ------------------------------------------------------------------
+
+    def _run_shap(
+        self,
+        X_train:       np.ndarray,
+        X_test:        np.ndarray,
+        y_test:        np.ndarray,
+        feature_names: list,
+    ) -> None:
+        """
+        Compute and plot SHAP values for the trained XGBoost model.
+
+        Uses a background sample of 500 training rows (enough to estimate
+        the base rate accurately while keeping runtime fast).
+        """
+        if not self.cfg.evaluation.compute_shap:
+            logger.info("SHAP disabled (config.evaluation.compute_shap=False).")
+            return
+
+        logger.info("\n--- SHAP Explanation (XGBoost) ---")
+        t0 = time.time()
+
+        try:
+            # Sample background from training set for the TreeExplainer
+            rng = np.random.default_rng(self.cfg.data.random_seed)
+            bg_idx  = rng.choice(len(X_train), size=min(500, len(X_train)), replace=False)
+            X_bg    = X_train[bg_idx]
+
+            self.shap_.fit(self.xgb_model_, X_bg)
+            self.shap_.compute(X_test, feature_names)
+            self.shap_.plot_all(X_test, y_test)
+
+            logger.info("SHAP completed in %.1f s", time.time() - t0)
+        except Exception as exc:
+            # SHAP is explanatory — never let it crash the training pipeline
+            logger.warning("SHAP explainer failed (non-fatal): %s", exc, exc_info=True)
 
     # ------------------------------------------------------------------
     # TabTransformer training

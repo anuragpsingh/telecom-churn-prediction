@@ -24,8 +24,8 @@ pandas>=2.2.0
 # Visualisation
 matplotlib>=3.8.0
 
-# Optional: SHAP explainability (uncomment to enable)
-# shap>=0.45.0
+# SHAP explainability (XGBoost TreeExplainer)
+shap>=0.45.0
 
 # Dev utilities
 tqdm>=4.66.0
