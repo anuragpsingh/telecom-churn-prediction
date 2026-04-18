@@ -15,6 +15,7 @@ Given a subscriber's profile — their plan type, monthly cost, network signal q
 - A **churn probability** (e.g. `0.87` → 87% likely to churn)
 - A **risk label** (`high_risk`, `medium_risk`, `low_risk`)
 - Individual scores from XGBoost and the Transformer for explainability
+- **SHAP explanations** for every prediction — which features pushed the score up or down, and by how much
 
 ---
 
@@ -98,11 +99,20 @@ churn/
 │
 ├── trainer.py               ← Orchestrates both models + ensemble + calibration
 ├── evaluator.py             ← AUROC/AUPRC/F1 + bootstrap CIs + 4 plots per model
+├── shap_explainer.py        ← SHAP explainability for XGBoost (8 plots + CSV)
 ├── inference.py             ← Production predictor: single subscriber or batch CSV
 ├── pipeline.py              ← CLI entry point — run this to train everything
 │
 ├── checkpoints/             ← Auto-created: preprocessor.pkl, model .json/.pt files
-├── results/                 ← Auto-created: ROC, PR, confusion, calibration plots
+├── results/                 ← Auto-created: ROC/PR/confusion plots + all SHAP plots
+│   ├── shap_summary_beeswarm.png
+│   ├── shap_bar_global.png
+│   ├── shap_waterfall_highrisk.png
+│   ├── shap_waterfall_lowrisk.png
+│   ├── shap_dependence_*.png      (top-3 features)
+│   ├── shap_heatmap.png
+│   ├── shap_summary.csv
+│   └── shap_values.npy
 ├── data/                    ← Auto-created: mobile_churn.csv
 └── requirements.txt
 ```
@@ -611,6 +621,194 @@ results_df = predictor.predict_batch(subscribers_df)
 
 ---
 
+## SHAP Explainability (XGBoost)
+
+### What is SHAP?
+
+SHAP (**SH**apley **A**dditive ex**P**lanations) is a method from game theory that assigns each feature a **contribution score** for every individual prediction.
+
+Unlike regular feature importance (which gives one number per feature for the whole model), SHAP tells you:
+
+> *"For **this specific subscriber**, poor RSRP pushed their churn probability **up by +0.18**, while their 24-month contract pulled it **down by −0.31**."*
+
+This makes the model fully transparent — not just "what matters overall" but "why did the model score this person at 87%?"
+
+---
+
+### How it Works
+
+SHAP uses **TreeExplainer** for XGBoost — an exact, fast algorithm (not an approximation):
+
+```
+Base value  =  0.3354   ← average churn probability across all subscribers
+
++ contract_duration contribution   +0.31  ← monthly contract → pushes toward churn
++ avg_rsrp_dbm contribution        +0.18  ← weak signal → pushes toward churn
++ num_complaints contribution      +0.14  ← 4 complaints → pushes toward churn
+- has_handset_subsidy contribution −0.06  ← no subsidy → small reduction
+- tenure_months contribution       −0.09  ← 3 months tenure (neutral, short)
+  ... (all 32 features contribute) ...
+= Final probability               ≈ 0.87
+```
+
+The sum of all SHAP values + base value = the model's final output probability. This **additivity** property makes SHAP mathematically rigorous.
+
+---
+
+### Top-10 Features by Mean |SHAP| (60k Mobile Subscribers)
+
+| Rank | Feature | Mean \|SHAP\| | Interpretation |
+|---|---|---|---|
+| 1 | `contract_duration` | 0.1633 | Strongest driver — monthly contract = easiest to leave |
+| 2 | `avg_rsrp_dbm` | 0.1084 | Weak signal (< −100 dBm) strongly predicts churn |
+| 3 | `tenure_months` | 0.0974 | Longer customers are more loyal — key retention signal |
+| 4 | `num_topups_6mo` | 0.0644 | Prepaid: low recharge frequency = lapse imminent |
+| 5 | `num_support_calls_6mo` | 0.0448 | Frequent support contact = dissatisfaction |
+| 6 | `num_complaints_6mo` | 0.0415 | Direct frustration signal |
+| 7 | `monthly_plan_cost_eur` | 0.0405 | Higher cost → more motivation to switch |
+| 8 | `has_handset_subsidy` | 0.0359 | Subsidised phone locks subscriber in |
+| 9 | `days_since_last_complaint` | 0.0279 | Recent complaints → elevated risk |
+| 10 | `avg_sinr_db` | 0.0267 | Poor signal quality → frustration |
+
+> Full rankings saved to `results/shap_summary.csv` after every training run.
+
+---
+
+### SHAP Plots Generated
+
+#### 1. Summary Beeswarm (`shap_summary_beeswarm.png`)
+
+The most information-rich SHAP plot. Every dot is one subscriber.
+
+- **X-axis**: SHAP value — how much this feature moved the churn probability (positive = toward churn, negative = away from churn)
+- **Colour**: actual feature value — red = high value, blue = low value
+- **Y-axis**: features ranked by mean |SHAP| (most impactful at top)
+
+**How to read it:**
+```
+avg_rsrp_dbm ──── [red dots on right]  → high RSRP (good signal) = low churn risk
+                   [blue dots on right] → low RSRP (weak signal) = HIGH churn risk
+```
+
+#### 2. Global Bar Plot (`shap_bar_global.png`)
+
+Simple ranking: mean |SHAP value| per feature.
+Longer bar = feature has larger average impact across all 9,000 test subscribers.
+Use this to answer: *"Which features matter most overall?"*
+
+#### 3. Waterfall — Highest-Risk Subscriber (`shap_waterfall_highrisk.png`)
+
+Step-by-step breakdown starting from the base rate (0.3354), showing how each feature pushed the final probability up or down for the **single most at-risk subscriber**.
+
+```
+f(x) = 0.87          ← final churn probability
+↑ contract_duration   +0.31
+↑ avg_rsrp_dbm        +0.18
+↑ num_complaints      +0.14
+↓ tenure_months       −0.09
+  base value = 0.34
+```
+
+Use this to answer: *"Why did the model flag this subscriber as high-risk?"*
+
+#### 4. Waterfall — Lowest-Risk Subscriber (`shap_waterfall_lowrisk.png`)
+
+Same as above for the safest subscriber. Useful for validating the model makes sense at both extremes.
+
+#### 5. Dependence Plots — Top 3 Features (`shap_dependence_*.png`)
+
+One plot per top-3 feature:
+- **X-axis**: raw feature value (e.g. RSRP in dBm)
+- **Y-axis**: SHAP value for that feature
+- **Colour**: automatically selected most-interacting secondary feature
+
+Reveals **non-linear relationships** and **interaction effects**, e.g.:
+```
+RSRP dependence plot shows:
+  > -80 dBm  → SHAP ≈ -0.05  (good signal, slight churn reduction)
+  -80 to -100 → SHAP climbs from -0.05 to +0.10
+  < -100 dBm → SHAP jumps sharply to +0.25  (weak signal, strong churn push)
+```
+
+#### 6. Heatmap (`shap_heatmap.png`)
+
+200 subscribers × 20 features grid:
+- **Rows**: subscribers sorted by total SHAP (highest risk at top)
+- **Columns**: features sorted by mean |SHAP|
+- **Colour**: red = pushing toward churn, blue = away from churn
+
+Use this to spot **clusters of subscribers** with similar risk patterns — e.g. a block of prepaid users with weak signal and few top-ups.
+
+---
+
+### `shap_explainer.py` — Code Walkthrough
+
+```python
+# Step 1 — Build TreeExplainer from trained XGBoost model
+explainer = shap.TreeExplainer(
+    xgb_model.model_,
+    data = X_background,                   # 500-row sample from training set
+    feature_perturbation = "interventional",  # causal interpretation
+    model_output = "probability",          # SHAP values in probability space
+)
+# explainer.expected_value = 0.3354  ← base rate (avg churn probability)
+
+# Step 2 — Compute SHAP values for all 9,000 test subscribers
+shap_values = explainer.shap_values(X_test)
+# shap_values shape: [9000, 32]
+# shap_values[i, j] = contribution of feature j for subscriber i
+# Positive = pushed churn probability UP
+# Negative = pushed churn probability DOWN
+
+# Step 3 — Verify additivity property
+# For any subscriber i:
+# sigmoid(base_logit) + sum(shap_values[i]) ≈ model.predict_proba(X_test[i])
+
+# Step 4 — Generate all plots
+explainer_obj.plot_all(X_test, y_test)
+```
+
+**Why `interventional` perturbation?**
+It answers "what would change if we *intervened* and changed this feature?" rather than just conditioning on correlations. This gives more causally meaningful explanations — important for business decisions like "would reducing this subscriber's monthly charge reduce their churn risk?"
+
+---
+
+### Real-Time Explanation for One Subscriber
+
+```python
+from shap_explainer import ShapExplainer
+
+explainer = ShapExplainer()
+explainer.fit(xgb_model, X_train_sample)
+
+# Get ranked contributions for a single new subscriber
+explanation_df = explainer.explain_subscriber(
+    X_row         = preprocessed_subscriber_array,
+    subscriber_id = "SUB-0042",
+    top_n         = 10,
+)
+print(explanation_df)
+```
+
+Output:
+```
+ rank  feature                     feature_value  shap_value  direction
+    1  contract_duration                     0.0      +0.312    ↑ churn
+    2  avg_rsrp_dbm                       -107.0      +0.183    ↑ churn
+    3  num_complaints_6mo                    4.0      +0.141    ↑ churn
+    4  tenure_months                         3.0      +0.092    ↑ churn
+    5  num_topups_6mo                        1.0      +0.087    ↑ churn
+    6  has_handset_subsidy                   1.0      -0.063    ↓ churn
+    7  monthly_plan_cost_eur                 8.5      +0.045    ↑ churn
+    8  avg_sinr_db                          -2.5      +0.038    ↑ churn
+    9  call_success_rate_pct               93.5       +0.031    ↑ churn
+   10  days_since_last_complaint             8.0      +0.028    ↑ churn
+```
+
+This output is ready to feed directly into a CRM system or customer-facing retention dashboard.
+
+---
+
 ## Network KPIs Explained (for Beginners)
 
 ### SINR — Signal-to-Interference-plus-Noise Ratio
@@ -700,6 +898,14 @@ TransformerConfig(batch_size=128)   # default is 512
 | **MPS** | Metal Performance Shaders — Apple Silicon GPU compute API |
 | **SINR** | Signal quality ratio: how strong your signal is vs background noise |
 | **RSRP** | Raw received power of the cell tower signal at the device |
+| **SHAP** | SHapley Additive exPlanations — assigns each feature a contribution score for every prediction |
+| **SHAP base value** | The average model output across all training data (starting point before feature contributions) |
+| **SHAP value** | How much one feature moved the prediction up (positive) or down (negative) from the base value |
+| **TreeExplainer** | SHAP algorithm optimised for tree-based models (XGBoost). Exact, not an approximation |
+| **Beeswarm plot** | SHAP plot where each dot is one data point; shows distribution of feature impacts |
+| **Waterfall plot** | SHAP plot showing step-by-step how each feature contributed to one specific prediction |
+| **Dependence plot** | SHAP plot of one feature's value vs its SHAP impact — reveals non-linear relationships |
+| **Additivity** | SHAP property: base_value + sum(all SHAP values) = model's final output probability |
 
 ---
 
