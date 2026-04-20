@@ -143,7 +143,7 @@ churn/
 | `call_success_rate_pct` | 88–99.9 % | % of voice calls successfully connected. < 97 % triggers frustration |
 | `bearer_establishment_rate_pct` | 88–99.9 % | % of data bearer sessions successfully set up. < 97 % is problematic |
 | `avg_call_drop_rate_pct` | 0.05–8 % | % of active calls that drop mid-conversation. > 2 % is a strong churn signal |
-| `avg_data_speed_mbps` | 0.1–350 Mbps | Average download speed (3G: 0.5–7 / 4G: 10–80 / 5G: 50–300) |
+| `avg_data_speed_mbps` | 0.1–350 Mbps | Average download speed (2G: 0.5–7 / 4G: 10–80 / 5G: 50–300) |
 
 #### Usage
 | Feature | Description |
@@ -180,7 +180,7 @@ churn/
 | `plan_tier` | `basic` / `standard` / `premium` / `unlimited` | Maps to 5–9 / 9–14 / 14–18 / 17–20 EUR |
 | `contract_duration` | `prepaid` / `monthly` / `12_month` / `24_month` | Monthly = highest churn risk |
 | `payment_method` | `direct_debit` / `credit_card` / `mobile_wallet` / `cash` | |
-| `network_generation` | `3G` / `4G` / `5G` | Affects speed, SINR baseline |
+| `network_generation` | `2G` / `4G` / `5G` | Affects speed, SINR baseline |
 | `device_type` | `smartphone` / `feature_phone` / `tablet` / `mifi` | |
 | `gender` | `Male` / `Female` | |
 | `is_roaming_enabled` | `yes` / `no` | |
@@ -359,7 +359,7 @@ Stage 7 — Churn Assignment  (domain-driven logit model)
 
 ```python
 # SINR baseline depends on network generation
-sinr_base = {"5G": 15.0, "4G": 11.0, "3G": 6.0}[network_generation]
+sinr_base = {"5G": 15.0, "4G": 11.0, "2G": 6.0}[network_generation]
 avg_sinr_db = clip(normal(sinr_base, std=7.0), low=-10, high=32)
 
 # RSRP correlates with SINR — better signal = higher received power
